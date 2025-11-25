@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IT Help Desk Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+        .card { transition: all 0.3s ease; }
+        .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05); }
+        .status-open { background-color: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; }
+        .status-progress { background-color: #fffbeb; color: #d97706; border: 1px solid #fcd34d; }
+        .status-closed { background-color: #f0fdf4; color: #16a34a; border: 1px solid #86efac; }
+    </style>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary': '#0e7490', // Tailwind cyan-700
+                        'secondary': '#475569', // Tailwind slate-600
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="p-4 sm:p-8">
+
+    <div class="max-w-6xl mx-auto">
+        <header class="text-center py-6 mb-8 bg-white rounded-xl shadow-lg">
+            <h1 class="text-4xl font-extrabold text-primary">IT Support Ticket Dashboard</h1>
+            <p class="text-secondary mt-2">Real-time tracking powered by Firebase Firestore</p>
+            <p id="user-display" class="text-xs text-gray-500 mt-2">Connecting...</p>
+        </header>
+
+        <!-- Ticket Submission Form -->
+        <div class="bg-white p-6 rounded-xl shadow-lg mb-8">
+            <h2 class="text-2xl font-semibold mb-4 text-secondary">Create New Ticket</h2>
+            <form id="ticket-form" class="space-y-4">
+                <input type="text" id="ticket-title" placeholder="Title (e.g., VPN connection issue)" required
+                       class="w-full p-3 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary">
+                <textarea id="ticket-description" rows="3" placeholder="Detailed description of the problem..." required
+                          class="w-full p-3 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary"></textarea>
+                <select id="ticket-priority" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary">
+                    <option value="Low">Priority: Low</option>
+                    <option value="Medium" selected>Priority: Medium</option>
+                    <option value="High">Priority: High</option>
+                </select>
+                <button type="submit" id="submit-button"
+                        class="w-full bg-primary text-white font-bold py-3 px-4 rounded-lg hover:bg-cyan-800 transition duration-300 disabled:opacity-50">
+                    Submit Ticket
+                </button>
+            </form>
+        </div>
+
+        <!-- Ticket List Section -->
+        <h2 class="text-2xl font-semibold mb-4 text-secondary section-heading">Open Tickets</h2>
+        <div id="ticket-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <!-- Tickets will be dynamically loaded here -->
+            <div id="loading-spinner" class="col-span-full text-center py-12 text-gray-500">
+                Loading tickets...
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase SDK Setup and Logic -->
+    <script type="module">
+        // Import necessary Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, updateDoc, deleteDoc, onSnapshot, collection, query, orderBy, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the environment (MANDATORY)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // DOM elements
+        const ticketList = document.getElementById('ticket-list');
+        const ticketForm = document.getElementById('ticket-form');
+        const userDisplay = document.getElementById('user-display');
+        const loadingSpinner = document.getElementById('loading-spinner');
+
+        let db;
+        let auth;
+        let userId = null;
+
+        // Utility function to get the correct collection path
+        function getCollectionPath(uid) {
+            // Private data storage path
+            return `artifacts/${appId}/users/${uid}/helpdesk_tickets`;
+        }
+
+        // --- 1. INITIALIZATION AND AUTHENTICATION ---
+        async function initializeFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                // setLogLevel('debug'); // Uncomment for debugging
+
+                // Authenticate user
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Listen for Auth State Changes
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        userDisplay.textContent = `User ID: ${userId} (Authenticated)`;
+                        startRealtimeTicketListener(); // Start listening for data only after auth is ready
+                    } else {
+                        // This should ideally not happen after signIn, but handles logged-out state
+                        userDisplay.textContent = 'Signed out.';
+                        userId = null;
+                        loadingSpinner.textContent = 'Please wait for authentication...';
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization or authentication failed:", error);
+                loadingSpinner.textContent = 'ERROR: Firebase failed to initialize.';
+            }
+        }
+        
+        // --- 2. CRUD OPERATIONS ---
+
+        // CREATE
+        async function createTicket(event) {
+            event.preventDefault();
+            if (!userId) {
+                console.error("User not authenticated yet.");
+                return;
+            }
+
+            const title = document.getElementById('ticket-title').value.trim();
+            const description = document.getElementById('ticket-description').value.trim();
+            const priority = document.getElementById('ticket-priority').value;
+
+            const newTicket = {
+                title: title,
+                description: description,
+                priority: priority,
+                status: 'Open', // Default status
+                createdAt: new Date().getTime(),
+                assignedTo: 'Unassigned',
+                reporterId: userId // Tracks who created the ticket
+            };
+
+            try {
+                const colRef = collection(db, getCollectionPath(userId));
+                await addDoc(colRef, newTicket);
+                ticketForm.reset();
+                console.log("Ticket added successfully.");
+            } catch (error) {
+                console.error("Error adding document: ", error);
+            }
+        }
+
+        // UPDATE (Status/Resolution)
+        async function updateTicketStatus(docId, newStatus) {
+            if (!userId) return;
+            try {
+                const docRef = doc(db, getCollectionPath(userId), docId);
+                await updateDoc(docRef, {
+                    status: newStatus,
+                    updatedAt: new Date().getTime()
+                });
+                console.log(`Ticket ${docId} status updated to ${newStatus}.`);
+            } catch (error) {
+                console.error("Error updating document: ", error);
+            }
+        }
+
+        // DELETE
+        async function deleteTicket(docId) {
+            if (!userId) return;
+            // Use a custom UI modal instead of window.confirm (as per instructions)
+            if (confirm("Are you sure you want to delete this ticket?")) {
+                try {
+                    const docRef = doc(db, getCollectionPath(userId), docId);
+                    await deleteDoc(docRef);
+                    console.log(`Ticket ${docId} deleted.`);
+                } catch (error) {
+                    console.error("Error deleting document: ", error);
+                }
+            }
+        }
+
+        // --- 3. REALTIME LISTENER (READ) ---
+        function startRealtimeTicketListener() {
+            if (!userId) return;
+            
+            const ticketsRef = collection(db, getCollectionPath(userId));
+            // IMPORTANT: Using an orderBy() without proper indexes can fail in production.
+            // For simplicity and compliance, we will fetch all and sort in memory.
+            const q = ticketsRef; // No orderBy to avoid potential index errors
+
+            loadingSpinner.style.display = 'block';
+            ticketList.innerHTML = '';
+
+            onSnapshot(q, (snapshot) => {
+                loadingSpinner.style.display = 'none';
+                
+                let ticketsData = [];
+                snapshot.forEach(doc => {
+                    ticketsData.push({ id: doc.id, ...doc.data() });
+                });
+
+                // Sort in memory by creation time (newest first)
+                ticketsData.sort((a, b) => b.createdAt - a.createdAt);
+
+                renderTickets(ticketsData);
+            }, (error) => {
+                console.error("Error listening to Firestore: ", error);
+                loadingSpinner.textContent = 'Failed to load tickets.';
+            });
+        }
+
+        // --- 4. UI RENDERING ---
+        function renderTickets(tickets) {
+            if (tickets.length === 0) {
+                ticketList.innerHTML = '<div class="col-span-full text-center py-12 text-gray-500">No tickets found. Submit a new one!</div>';
+                return;
+            }
+
+            ticketList.innerHTML = ''; // Clear previous tickets
+
+            tickets.forEach(ticket => {
+                const statusClass = ticket.status === 'Open' ? 'status-open' : 
+                                    ticket.status === 'In Progress' ? 'status-progress' : 
+                                    'status-closed';
+
+                const date = new Date(ticket.createdAt).toLocaleDateString();
+
+                const ticketElement = document.createElement('div');
+                ticketElement.className = 'card bg-white p-5 rounded-xl shadow-md border border-gray-100';
+                ticketElement.innerHTML = `
+                    <div class="flex justify-between items-start mb-3">
+                        <span class="text-xs font-semibold px-2 py-1 rounded-full ${statusClass}">${ticket.status}</span>
+                        <span class="text-xs font-medium text-gray-500">${date}</span>
+                    </div>
+                    <h3 class="text-xl font-bold text-gray-800 mb-2">${ticket.title}</h3>
+                    <p class="text-sm text-gray-600 mb-4 h-12 overflow-hidden">${ticket.description}</p>
+                    <div class="text-xs text-gray-500 space-y-1 mb-4">
+                        <p><strong>Priority:</strong> <span class="font-semibold text-red-500">${ticket.priority}</span></p>
+                        <p><strong>Assigned:</strong> ${ticket.assignedTo}</p>
+                        <p><strong>ID:</strong> ${ticket.id}</p>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="flex flex-wrap gap-2 pt-3 border-t border-gray-100">
+                        <button data-id="${ticket.id}" data-action="progress"
+                            class="text-xs bg-yellow-100 text-yellow-800 font-medium py-1 px-3 rounded-full hover:bg-yellow-200">
+                            Set Progress
+                        </button>
+                        <button data-id="${ticket.id}" data-action="close"
+                            class="text-xs bg-green-100 text-green-800 font-medium py-1 px-3 rounded-full hover:bg-green-200">
+                            Close Ticket
+                        </button>
+                        <button data-id="${ticket.id}" data-action="delete"
+                            class="text-xs bg-red-100 text-red-800 font-medium py-1 px-3 rounded-full hover:bg-red-200 ml-auto">
+                            Delete
+                        </button>
+                    </div>
+                `;
+                ticketList.appendChild(ticketElement);
+            });
+
+            // Attach event listeners to the new buttons
+            ticketList.querySelectorAll('button[data-action]').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    const id = e.target.getAttribute('data-id');
+                    const action = e.target.getAttribute('data-action');
+                    
+                    if (action === 'progress') {
+                        updateTicketStatus(id, 'In Progress');
+                    } else if (action === 'close') {
+                        updateTicketStatus(id, 'Closed');
+                    } else if (action === 'delete') {
+                        deleteTicket(id);
+                    }
+                });
+            });
+        }
+
+        // --- 5. EVENT HANDLERS & STARTUP ---
+        ticketForm.addEventListener('submit', createTicket);
+
+        // Start the application
+        initializeFirebase();
+    </script>
+</body>
+</html>
